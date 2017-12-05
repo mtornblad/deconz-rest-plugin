@@ -76,7 +76,9 @@ else {
 
 QMAKE_CXXFLAGS += -Wno-attributes
 
-HEADERS  = bindings.h \
+HEADERS  = AES.h \
+	   AES_config.h \
+	   bindings.h \
            connectivity.h \
            colorspace.h \
            de_web_plugin.h \
@@ -99,7 +101,8 @@ HEADERS  = bindings.h \
            sensor.h \
            websocket_server.h
 
-SOURCES  = authentification.cpp \
+SOURCES  = AES.cpp \
+	   authentification.cpp \
            atmel_wsndemo_sensor.cpp \
            bindings.cpp \
            change_channel.cpp \

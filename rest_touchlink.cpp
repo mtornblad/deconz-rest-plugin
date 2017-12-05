@@ -15,6 +15,7 @@
 #include "de_web_plugin.h"
 #include "de_web_plugin_private.h"
 #include "json.h"
+#include "AES.h"
 
 // duration to wait for scan responses
 #define TL_SCAN_WAIT_TIME 250
@@ -47,6 +48,10 @@
 
 #define NETWORK_ATTEMPS 10
 
+
+uint8_t expandedKeyInput[16];
+
+
 /*! Init the touchlink api and helpers.
  */
 void DeRestPluginPrivate::initTouchlinkApi()
@@ -69,6 +74,7 @@ void DeRestPluginPrivate::initTouchlinkApi()
     touchlinkTimer->setSingleShot(true);
     connect(touchlinkTimer, SIGNAL(timeout()),
             this, SLOT(touchlinkTimerFired()));
+
 }
 
 /*! Touchlink REST API broker.
@@ -110,6 +116,13 @@ int DeRestPluginPrivate::handleTouchlinkApi(ApiRequest &req, ApiResponse &rsp)
         return resetLight(req, rsp);
     }
 
+    // POST /api/<apikey>/touchlink/<id>/join
+    if ((req.path.size() == 5) && (req.hdr.method() == "POST") && (req.path[4] == "join"))
+    {
+        return joinLight(req, rsp);
+    }
+
+    
     return REQ_NOT_HANDLED;
 }
 
@@ -323,6 +336,75 @@ int DeRestPluginPrivate::resetLight(ApiRequest &req, ApiResponse &rsp)
     return REQ_READY_SEND;
 }
 
+
+
+/*! POST /api/<apikey>/touchlink/<id>/join
+    \param req - request data
+    \param rsp - response data
+    \return REQ_READY_SEND
+            REQ_NOT_HANDLED
+ */
+int DeRestPluginPrivate::joinLight(ApiRequest &req, ApiResponse &rsp)
+{
+    /*
+     * - disconnect
+     * - start interpan mode
+     * - send interpan scan request
+     * - send interpan join request
+     * - reconnect
+     */
+
+    if (touchlinkState != TL_Idle)
+    {
+        rsp.httpStatus = HttpStatusServiceUnavailable;
+        return REQ_READY_SEND;
+    }
+
+    QString id = req.path[3];
+
+    touchlinkDevice.id.clear(); // mark as undefined
+
+    { // search the device according to its id
+        std::vector<ScanResponse>::const_iterator i = touchlinkScanResponses.begin();
+        std::vector<ScanResponse>::const_iterator end = touchlinkScanResponses.end();
+
+        for (; i != end; ++i)
+        {
+            if (i->id == id)
+            {
+                touchlinkDevice = *i;
+                break;
+            }
+        }
+    }
+
+    if (touchlinkDevice.id.isEmpty())
+    {
+        rsp.httpStatus = HttpStatusNotFound;
+        return REQ_READY_SEND;
+    }
+
+    uint32_t transactionId = qrand();
+
+    if (transactionId == 0)
+    {
+        transactionId++;
+    }
+
+    touchlinkReq.setTransactionId(transactionId);
+    touchlinkAction = TouchlinkJoin;
+    touchlinkChannel = touchlinkDevice.channel;
+
+    DBG_Printf(DBG_TLINK, "start touchlink join for 0x%016llX\n", touchlinkDevice.address.ext());
+
+    touchlinkDisconnectNetwork();
+
+    rsp.httpStatus = HttpStatusOk;
+
+    return REQ_READY_SEND;
+}
+
+
 /*! Starts the interpan mode.
     \param channel the channel which shall be used for interpan communication
  */
@@ -369,6 +451,11 @@ void DeRestPluginPrivate::startTouchlinkModeConfirm(deCONZ::TouchlinkStatus stat
         sendTouchlinkScanRequest();
     }
     else if (touchlinkAction == TouchlinkReset)
+    {
+        // must be send prior to identify request because we need a valid transaction id
+        sendTouchlinkScanRequest();
+    }
+    else if (touchlinkAction == TouchlinkJoin)
     {
         // must be send prior to identify request because we need a valid transaction id
         sendTouchlinkScanRequest();
@@ -578,6 +665,90 @@ void DeRestPluginPrivate::sendTouchlinkResetRequest()
     }
 }
 
+/*! Sends the touchlink reset request to a device.
+ */
+void DeRestPluginPrivate::sendTouchlinkJoinRequest()
+{
+    AES aes;
+    touchlinkReq.setChannel(touchlinkChannel);
+    touchlinkReq.setDstAddressMode(deCONZ::ApsExtAddress);
+    touchlinkReq.dstAddress() = touchlinkDevice.address;
+    touchlinkReq.setPanId(touchlinkDevice.panid);
+    touchlinkReq.setClusterId(0x1000);
+    touchlinkReq.setProfileId(ZLL_PROFILE_ID);
+
+    touchlinkReq.asdu().clear();
+
+    QDataStream stream(&touchlinkReq.asdu(), QIODevice::WriteOnly);
+    stream.setByteOrder(QDataStream::LittleEndian);
+
+    uint8_t cmd = TL_CMD_NETWORK_JOIN_ROUTER_REQ;
+    uint8_t frameControl = deCONZ::ZclFCProfileCommand | deCONZ::ZclFCDirectionClientToServer;
+    uint8_t seq = touchlinkReq.transactionId();
+
+    uint8_t extendedPan[8] = {0x16, 0xff, 0xd6, 0x01, 0x00, 0x8d, 0x15, 0x00};  //Xiara
+    uint8_t keyIndex = 4;
+    uint8_t networkUpdateId = 0;
+    uint8_t logicalChannel = apsCtrl->getParameter(deCONZ::ParamCurrentChannel);
+    uint16_t panId = apsCtrl->getParameter(deCONZ::ParamPANID);
+    uint16_t networkAddress = 0xABCD;
+
+    uint16_t gidBegin = 0;
+    uint16_t gidEnd = 0;
+    uint16_t nwkRangeBegin = 0;
+    uint16_t nwkRangeEnd = 0;
+    uint16_t gidRangeBegin = 0;
+    uint16_t gidRangeEnd = 0;
+
+    //0x0 below in masterKey should be updated with correct ZLL master key
+    uint8_t masterKey[16] = {0x9F, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x31};
+    uint8_t transportKey[16];
+    uint8_t encryptedNetworkKey[16];
+
+    aes.set_key(masterKey, 128);
+    aes.encrypt(expandedKeyInput, transportKey);
+    aes.set_key(transportKey, 128);
+    aes.encrypt((unsigned char*)apsCtrl->getParameter(deCONZ::ParamNetworkKey).data(), encryptedNetworkKey);
+
+    stream << frameControl;
+    stream << seq;
+    stream << cmd;
+    stream << touchlinkReq.transactionId();
+
+    
+    //paramExtendedPANID returns zeros, workaround to use hardcoded value for now
+    stream.writeRawData((const char*) extendedPan, 8);  
+    //stream << apsCtrl->getParameter(deCONZ::ParamExtendedPANID);
+
+
+    stream << keyIndex;
+   
+    stream.writeRawData((const char*) encryptedNetworkKey, 16); 
+    
+    stream << networkUpdateId;
+    stream << logicalChannel;
+    stream << panId;
+    stream << networkAddress;
+    stream << gidBegin;
+    stream << gidEnd;
+    stream << nwkRangeBegin;
+    stream << nwkRangeEnd;
+    stream << gidRangeBegin;
+    stream << gidRangeEnd;
+
+    DBG_Printf(DBG_TLINK, "send join request TrId: 0x%08X\n", touchlinkReq.transactionId());
+    if (touchlinkCtrl->sendInterpanRequest(touchlinkReq) == 0)
+    {
+        touchlinkState = TL_SendingResetRequest;
+    }
+    else
+    {
+        DBG_Printf(DBG_TLINK, "touchlink send reset request failed\n");
+        // abort and restore previous network state
+        touchlinkStartReconnectNetwork(TL_RECONNECT_NOW);
+    }
+}
+
 /*! Starts a delayed action based on current touchlink state.
  */
 void DeRestPluginPrivate::touchlinkTimerFired()
@@ -640,6 +811,7 @@ void DeRestPluginPrivate::sendTouchlinkConfirm(deCONZ::TouchlinkStatus status)
 
         case TouchlinkIdentify:
         case TouchlinkReset:
+        case TouchlinkJoin:
         {
             touchlinkState = TL_WaitScanResponses;
             touchlinkTimer->start(TL_TRANSACTION_TIMEOUT);
@@ -660,7 +832,8 @@ void DeRestPluginPrivate::sendTouchlinkConfirm(deCONZ::TouchlinkStatus status)
         // empty
     }
     else if ((touchlinkState == TL_SendingIdentifyRequest) ||
-             (touchlinkState == TL_SendingResetRequest))
+    		 (touchlinkState == TL_SendingJoinRequest) ||
+             (touchlinkState == TL_SendingResetRequest) )
     {
         if (status == deCONZ::TouchlinkSuccess)
         {
@@ -701,7 +874,7 @@ void DeRestPluginPrivate::touchlinkScanTimeout()
         return;
     }
 
-    if (touchlinkAction == TouchlinkReset || touchlinkAction == TouchlinkIdentify)
+    if (touchlinkAction == TouchlinkReset || touchlinkAction == TouchlinkIdentify || touchlinkAction == TouchlinkJoin)
     {
         DBG_Printf(DBG_TLINK, "wait for scan response before reset/identify to fn timeout\n");
         touchlinkStartReconnectNetwork(TL_RECONNECT_NOW);
@@ -839,6 +1012,22 @@ void DeRestPluginPrivate::interpanDataIndication(const QByteArray &data)
                 {
                     touchlinkTimer->stop();
                     sendTouchlinkIdentifyRequest();
+                }
+            }
+            else if (touchlinkAction == TouchlinkJoin)
+            {
+                if (scanResponse.address.ext() == touchlinkDevice.address.ext())
+                {
+                    touchlinkTimer->stop();
+                    for(int j=0; j<=3; j++)
+                    {
+			expandedKeyInput[3-j]=asdu[j+3];
+			expandedKeyInput[7-j]=asdu[j+3];
+                        expandedKeyInput[11-j]=asdu[j+12];
+                        expandedKeyInput[15-j]=asdu[j+12];
+		    }
+		    sendTouchlinkIdentifyRequest();
+		    sendTouchlinkJoinRequest();
                 }
             }
         }

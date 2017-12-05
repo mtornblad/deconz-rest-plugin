@@ -697,6 +697,7 @@ public:
     int getTouchlinkScanResults(ApiRequest &req, ApiResponse &rsp);
     int identifyLight(ApiRequest &req, ApiResponse &rsp);
     int resetLight(ApiRequest &req, ApiResponse &rsp);
+    int joinLight(ApiRequest &req, ApiResponse &rsp);
 
     // REST API sensors
     int handleSensorsApi(ApiRequest &req, ApiResponse &rsp);
@@ -838,6 +839,7 @@ public Q_SLOTS:
     void sendTouchlinkScanRequest();
     void sendTouchlinkIdentifyRequest();
     void sendTouchlinkResetRequest();
+    void sendTouchlinkJoinRequest(); 
     void touchlinkTimerFired();
     void touchlinkScanTimeout();
     void interpanDataIndication(const QByteArray &data);
@@ -1219,14 +1221,17 @@ public:
         // identify
         TL_SendingIdentifyRequest,
         // reset
-        TL_SendingResetRequest
+        TL_SendingResetRequest, 
+        // join
+        TL_SendingJoinRequest
     };
 
     enum TouchlinkAction
     {
         TouchlinkScan,
         TouchlinkIdentify,
-        TouchlinkReset
+        TouchlinkReset,
+        TouchlinkJoin
     };
 
     struct ScanResponse
